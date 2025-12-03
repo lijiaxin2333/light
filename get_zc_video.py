@@ -121,7 +121,7 @@ def launch_gui() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("ZaoCi MP4 下载器")
-            self.resize(520, 320)
+            self.resize(520, 260)
 
             self.url_edit = QtWidgets.QLineEdit()
             self.url_edit.setPlaceholderText("https://www.zaoci.tv/share/video/...")
@@ -130,8 +130,7 @@ def launch_gui() -> None:
             self.dir_edit.setPlaceholderText("选择输出目录")
             self.browse_btn = QtWidgets.QPushButton("浏览...")
 
-            self.output_edit = QtWidgets.QLineEdit()
-            self.output_edit.setPlaceholderText("output_x.mp4")
+            self.status_label = QtWidgets.QLabel("保存文件将自动命名，例如 output_1.mp4")
 
             self.start_btn = QtWidgets.QPushButton("开始下载")
             self.log_view = QtWidgets.QTextEdit()
@@ -144,7 +143,7 @@ def launch_gui() -> None:
             dir_layout.addWidget(self.dir_edit)
             dir_layout.addWidget(self.browse_btn)
             form.addRow("输出目录:", dir_layout)
-            form.addRow("输出文件名:", self.output_edit)
+            form.addRow("命名说明:", self.status_label)
 
             layout = QtWidgets.QVBoxLayout(self)
             layout.addLayout(form)
@@ -152,35 +151,18 @@ def launch_gui() -> None:
             layout.addWidget(self.log_view)
 
             self.worker: VideoFetcherWorker | None = None
-            self.last_auto_name = ""
 
             self.browse_btn.clicked.connect(self.choose_directory)
-            self.dir_edit.editingFinished.connect(self.handle_dir_finished)
             self.start_btn.clicked.connect(self.start_download)
 
         def choose_directory(self) -> None:
             directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择输出目录")
             if directory:
                 self.dir_edit.setText(directory)
-                self.update_default_output()
-
-        def handle_dir_finished(self) -> None:
-            self.update_default_output()
-
-        def update_default_output(self) -> None:
-            directory = pathlib.Path(self.dir_edit.text()).expanduser()
-            if not directory.exists():
-                return
-            new_name = compute_default_output_name(directory)
-            current = self.output_edit.text().strip()
-            if not current or current == self.last_auto_name:
-                self.output_edit.setText(new_name)
-            self.last_auto_name = new_name
 
         def start_download(self) -> None:
             url = self.url_edit.text().strip()
             directory = pathlib.Path(self.dir_edit.text()).expanduser()
-            filename = self.output_edit.text().strip()
 
             if not url:
                 self.append_log("请填写分享链接。")
@@ -190,13 +172,7 @@ def launch_gui() -> None:
                 return
             directory.mkdir(parents=True, exist_ok=True)
 
-            if not filename:
-                filename = compute_default_output_name(directory)
-                self.output_edit.setText(filename)
-            if not filename.lower().endswith(".mp4"):
-                filename = f"{filename}.mp4"
-                self.output_edit.setText(filename)
-
+            filename = compute_default_output_name(directory, suffix=".mp4")
             destination = directory / filename
             if destination.exists():
                 reply = QtWidgets.QMessageBox.question(
@@ -208,7 +184,7 @@ def launch_gui() -> None:
                     return
 
             self.toggle_inputs(False)
-            self.append_log("任务启动...")
+            self.append_log(f"任务启动，文件将保存为 {destination.name}")
             self.worker = VideoFetcherWorker(url, destination, timeout=30)
             self.worker.progress.connect(self.append_log)
             self.worker.finished.connect(self.on_finished)
@@ -226,7 +202,6 @@ def launch_gui() -> None:
             for widget in (
                 self.url_edit,
                 self.dir_edit,
-                self.output_edit,
                 self.browse_btn,
                 self.start_btn,
             ):

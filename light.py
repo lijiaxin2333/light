@@ -11,6 +11,7 @@
 
 依赖:
     pip install opencv-python numpy
+    brew install ffmpeg
 
 用法:
     python light.py --source-dir ./videos --output-dir ./output
@@ -23,6 +24,8 @@ import csv
 import math
 import pathlib
 import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
@@ -43,50 +46,87 @@ class GridDetectionResult:
 def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridDetectionResult:
     """
     检测画面中心是否有分割线。
-    
-    只检测画面正中央（1/2位置）是否有贯穿的分割线：
-    - 竖线：从上到下贯穿画面中央
-    - 横线：从左到右贯穿画面中央
-    
-    threshold: 分割线需要贯穿的比例，默认0.6表示需要贯穿60%以上才算
+
+    策略：
+    1. 缩放至固定尺寸，分析中央竖/横带贯穿程度
+    2. 若背景接近纯黑/纯白，先提取非背景区域，再判断线条是否存在
+    3. 若背景非纯色，则退回到边缘检测
+
+    threshold: 分割线需要贯穿的比例，默认0.6 表示贯穿 60% 以上
     """
-    # 缩放到统一尺寸
+
     DETECT_SIZE = (320, 180)
+    BG_RATIO_THRESHOLD = 0.7  # 背景判定（黑/白占比达到 70%）
+    BG_TOLERANCE = 12
+    MIN_CONTENT_RATIO = 0.05
+    BAND_OCCUPANCY_THRESHOLD = 0.08  # 中央带中允许的前景占比
+
     small = cv2.resize(frame, DETECT_SIZE, interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    
-    # 边缘检测（使用较严格的参数）
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blur, 80, 200)
-    
-    h, w = edges.shape
-    
-    # 检测中央竖线（在宽度的1/2位置，检测一个窄带）
+
+    h, w = gray.shape
     center_x = w // 2
-    band_width = max(3, w // 30)  # 窄带宽度
+    center_y = h // 2
+    band_width = max(3, w // 30)
+    band_height = max(3, h // 30)
     left = center_x - band_width // 2
     right = center_x + band_width // 2 + 1
-    
-    vertical_band = edges[:, left:right]
-    # 计算每一行是否有边缘点（即该行是否被竖线穿过）
-    row_has_edge = np.any(vertical_band > 0, axis=1)
-    vertical_score = np.mean(row_has_edge)  # 竖线贯穿的比例
-    
-    # 检测中央横线（在高度的1/2位置，检测一个窄带）
-    center_y = h // 2
-    band_height = max(3, h // 30)
     top = center_y - band_height // 2
     bottom = center_y + band_height // 2 + 1
-    
-    horizontal_band = edges[top:bottom, :]
-    # 计算每一列是否有边缘点（即该列是否被横线穿过）
-    col_has_edge = np.any(horizontal_band > 0, axis=0)
-    horizontal_score = np.mean(col_has_edge)  # 横线贯穿的比例
-    
-    # 判断：分数需要超过阈值才算有分割线
+
+    def compute_band_background_ratio(mask_band: np.ndarray, axis: int) -> float:
+        """
+        计算中央带有多少比例是“背景”(即缺少内容)。
+        axis = 0 表示纵向统计（对行求平均）；axis = 1 表示横向统计（对列求平均）
+        """
+        if axis == 0:  # vertical band -> 按行统计
+            occupancy = np.mean(mask_band, axis=1)
+        else:  # horizontal band -> 按列统计
+            occupancy = np.mean(mask_band, axis=0)
+        return float(np.mean(occupancy <= BAND_OCCUPANCY_THRESHOLD))
+
+    # 1) 判断是否为纯色背景
+    white_ratio = np.mean(gray >= 255 - BG_TOLERANCE)
+    black_ratio = np.mean(gray <= BG_TOLERANCE)
+    background_value: Optional[int] = None
+    if white_ratio >= BG_RATIO_THRESHOLD:
+        background_value = 255
+    elif black_ratio >= BG_RATIO_THRESHOLD:
+        background_value = 0
+
+    if background_value is not None:
+        # 纯黑 / 纯白背景：先提取非背景区域
+        mask = (np.abs(gray.astype(np.int16) - background_value) > BG_TOLERANCE).astype(np.uint8) * 255
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask_bool = mask > 0
+        content_ratio = float(np.mean(mask_bool))
+        if content_ratio < MIN_CONTENT_RATIO:
+            # 几乎全是背景，不认为是宫格
+            vertical_score = 0.0
+            horizontal_score = 0.0
+        else:
+            vertical_band = mask_bool[:, left:right]
+            horizontal_band = mask_bool[top:bottom, :]
+            vertical_score = compute_band_background_ratio(vertical_band, axis=0)
+            horizontal_score = compute_band_background_ratio(horizontal_band, axis=1)
+    else:
+        # 2) 普通背景：使用边缘检测
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blur, 80, 200)
+
+        vertical_band = edges[:, left:right]
+        row_has_edge = np.any(vertical_band > 0, axis=1)
+        vertical_score = float(np.mean(row_has_edge))
+
+        horizontal_band = edges[top:bottom, :]
+        col_has_edge = np.any(horizontal_band > 0, axis=0)
+        horizontal_score = float(np.mean(col_has_edge))
+
     has_vertical = vertical_score >= threshold
     has_horizontal = horizontal_score >= threshold
-    
+
     if has_vertical and has_horizontal:
         grid_type = "four"
         is_grid = True
@@ -99,7 +139,7 @@ def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridD
     else:
         grid_type = "none"
         is_grid = False
-    
+
     return GridDetectionResult(
         is_grid=is_grid,
         vertical_score=vertical_score,
@@ -157,7 +197,7 @@ def export_video_without_prefix(
     trim_frames: int,
     codec: str,
 ) -> Tuple[float, float, int]:
-    """导出视频（跳过前trim_frames帧）"""
+    """导出视频（跳过前 trim_frames 帧），保留原始音轨。"""
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
@@ -172,12 +212,20 @@ def export_video_without_prefix(
         capture.release()
         raise RuntimeError("裁剪帧数超过或等于总帧数，放弃导出。")
 
+    start_seconds = trim_frames / fps if fps > 0 else 0.0
+    output_duration = max(0.0, original_duration - start_seconds)
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="grid_trim_")
+    temp_dir_path = pathlib.Path(temp_dir.name)
+    temp_video_path = temp_dir_path / "video_only.mp4"
+    temp_audio_path = temp_dir_path / "audio_track.aac"
+
+    # 写出视频（无音频）
     fourcc = cv2.VideoWriter_fourcc(*codec)
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-    
+    writer = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
     if trim_frames > 0:
         capture.set(cv2.CAP_PROP_POS_FRAMES, trim_frames)
-    
+
     while True:
         ret, frame = capture.read()
         if not ret:
@@ -186,9 +234,58 @@ def export_video_without_prefix(
 
     capture.release()
     writer.release()
-    
-    output_frames = total_frames - trim_frames
-    output_duration = output_frames / fps if fps > 0 else 0.0
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        print("  警告: 未找到 ffmpeg，无法保留音频，输出将是无声视频。")
+        shutil.copy2(temp_video_path, output_path)
+        temp_dir.cleanup()
+        return original_duration, output_duration, trim_frames
+
+    # 提取音轨并裁剪相同的起始时间
+    audio_cmd = [
+        ffmpeg_path,
+        "-y",
+        "-ss",
+        f"{start_seconds:.6f}",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "copy",
+        str(temp_audio_path),
+    ]
+    audio_result = subprocess.run(audio_cmd, capture_output=True)
+    if audio_result.returncode != 0:
+        print("  警告: 音轨提取失败，输出将是无声视频。")
+        shutil.copy2(temp_video_path, output_path)
+        temp_dir.cleanup()
+        return original_duration, output_duration, trim_frames
+
+    # 将音轨塞回视频
+    mux_cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(temp_video_path),
+        "-i",
+        str(temp_audio_path),
+        "-c",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        str(output_path),
+    ]
+    mux_result = subprocess.run(mux_cmd, capture_output=True)
+    if mux_result.returncode != 0:
+        print("  警告: 合并音轨失败，输出将是无声视频。")
+        shutil.copy2(temp_video_path, output_path)
+        temp_dir.cleanup()
+        return original_duration, output_duration, trim_frames
+
+    temp_dir.cleanup()
     return original_duration, output_duration, trim_frames
 
 
@@ -277,9 +374,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="检测并裁剪视频开头的宫格帧（四宫格/两宫格）")
     parser.add_argument("--source-dir", default=".", help="视频目录 (默认当前目录)")
     parser.add_argument("--output-dir", default="output", help="输出目录 (默认 ./output)")
-    parser.add_argument("--max-check-seconds", type=float, default=2.0, help="最多检测开头多少秒 (默认2)")
-    parser.add_argument("--grid-threshold", type=float, default=0.6, help="分割线贯穿比例阈值，越高越严格 (默认0.6)")
-    parser.add_argument("--max-trim-seconds", type=float, default=1.0, help="最多裁剪多少秒 (默认1)")
+    parser.add_argument("--max-check-seconds", type=float, default=1.2, help="最多检测开头多少秒 (默认2)")
+    parser.add_argument("--grid-threshold", type=float, default=0.5, help="分割线贯穿比例阈值，越高越严格 (默认0.6)")
+    parser.add_argument("--max-trim-seconds", type=float, default=1.2, help="最多裁剪多少秒 (默认2)")
     parser.add_argument("--codec", default="mp4v", help="输出编码 (默认 mp4v)")
     parser.add_argument("--dry-run", action="store_true", help="只分析不写入")
     parser.add_argument("--ext", default=",".join(sorted(SUPPORTED_SUFFIXES)), help="文件扩展名")
