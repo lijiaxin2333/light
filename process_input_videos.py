@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -28,63 +27,40 @@ import light
 @dataclass
 class VideoEntry:
     index: int
-    url: str
     file_id: str
     filename: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="批量处理 input 目录视频并记录状态")
-    parser.add_argument("--csv-path", type=Path, default=Path("执行结果9.csv"), help="执行结果 CSV 路径")
     parser.add_argument("--input-dir", type=Path, default=Path("input"), help="待处理视频目录")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="输出目录")
     parser.add_argument("--max-check-seconds", type=float, default=1.2, help="检测开头多少秒")
     parser.add_argument("--grid-threshold", type=float, default=0.5, help="分割线贯穿阈值")
-    parser.add_argument("--max-trim-seconds", type=float, default=1.2, help="最多裁剪秒数")
+    parser.add_argument("--max-trim-seconds", type=float, default=1.0, help="最多裁剪秒数")
     parser.add_argument("--codec", default="mp4v", help="导出编码")
     parser.add_argument("--dry-run", action="store_true", help="仅分析不写入")
     parser.add_argument("--workers", type=int, default=8, help="并行线程数 (默认 8)")
     return parser.parse_args()
 
 
-def load_entries(csv_path: Path) -> List[VideoEntry]:
-    if not csv_path.exists():
-        raise FileNotFoundError(f"未找到 CSV: {csv_path}")
+def load_entries(input_dir: Path) -> List[VideoEntry]:
+    if not input_dir.exists():
+        raise FileNotFoundError(f"未找到 input 目录: {input_dir}")
 
+    files = sorted(
+        [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == ".mp4"],
+        key=lambda p: p.name,
+    )
     entries: List[VideoEntry] = []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        header_skipped = False
-        for idx, row in enumerate(reader, start=1):
-            if not row:
-                continue
-            if not header_skipped and row[0].strip().lower() == "result":
-                header_skipped = True
-                continue
-            header_skipped = True
-            raw = row[0]
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                print(f"[WARN] JSON 解析失败，跳过：{raw[:80]}...")
-                continue
-            video = data.get("video") or {}
-            url = video.get("url")
-            if not isinstance(url, str) or not url.strip():
-                print(f"[WARN] 缺少 url，跳过：{raw[:80]}...")
-                continue
-            file_id = url.rstrip("/").rsplit("/", 1)[-1]
-            if file_id.lower().endswith(".mp4"):
-                file_id = file_id[:-4]
-            safe_id = "".join(ch for ch in file_id if ch.isalnum() or ch in ("-", "_")) or "video"
-            entries.append(
-                VideoEntry(
-                    index=len(entries) + 1,
-                    url=url,
-                    file_id=safe_id,
-                    filename=f"{safe_id}.mp4",
-                )
+    for idx, path in enumerate(files, start=1):
+        entries.append(
+            VideoEntry(
+                index=idx,
+                file_id=path.stem,
+                filename=path.name,
             )
+        )
     return entries
 
 
@@ -117,7 +93,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
             if not input_path.exists():
                 return [
                     str(entry.index),
-                    entry.filename,
+                    entry.file_id,
                     "0",
                     "0.00",
                     "缺失",
@@ -136,7 +112,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
             except Exception as exc:  # pylint: disable=broad-except
                 return [
                     str(entry.index),
-                    entry.filename,
+                    entry.file_id,
                     "0",
                     "0.00",
                     f"失败: {exc}",
@@ -146,7 +122,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
             if not result:
                 return [
                     str(entry.index),
-                    entry.filename,
+                    entry.file_id,
                     "0",
                     "0.00",
                     "跳过",
@@ -157,7 +133,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
             status = "已裁剪" if trimmed_frames > 0 else "保持原样"
             return [
                 str(entry.index),
-                entry.filename,
+                entry.file_id,
                 str(trimmed_frames),
                 f"{trimmed_seconds:.2f}",
                 status,
@@ -173,7 +149,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                     append_row(
                         [
                             str(entry.index),
-                            entry.filename,
+                            entry.file_id,
                             "0",
                             "0.00",
                             "重复跳过",
@@ -205,9 +181,9 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
 
 def main() -> None:
     args = parse_args()
-    entries = load_entries(args.csv_path.expanduser().resolve())
+    entries = load_entries(args.input_dir.expanduser().resolve())
     if not entries:
-        print("CSV 中没有可用条目")
+        print("input 目录中没有可用视频")
         return
     process_videos(entries, args)
 

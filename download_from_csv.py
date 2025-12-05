@@ -19,7 +19,7 @@ import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Union
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=8,
+        default=16,
         help="下载线程数 (默认 8)",
     )
     parser.add_argument(
@@ -54,6 +54,44 @@ def parse_args() -> argparse.Namespace:
         help="若输出文件已存在则跳过下载",
     )
     return parser.parse_args()
+
+
+JsonType = Union[str, int, float, bool, None, dict, list]
+
+
+def extract_mp4_url(data: JsonType) -> Optional[str]:
+    if isinstance(data, str):
+        candidate = data.strip()
+        if candidate.lower().endswith(".mp4") and candidate.startswith("http"):
+            return candidate
+        # 有些链接后带 query，满足 *.mp4?xx
+        if ".mp4" in candidate and candidate.startswith("http"):
+            idx = candidate.lower().find(".mp4")
+            return candidate[: idx + 4]
+        return None
+    if isinstance(data, dict):
+        # 优先常见字段
+        video = data.get("video")
+        if isinstance(video, dict):
+            url = video.get("url")
+            if isinstance(url, str) and url.strip():
+                return extract_mp4_url(url)
+        for key in ("mediaUrl", "url"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                found = extract_mp4_url(val)
+                if found:
+                    return found
+        for value in data.values():
+            found = extract_mp4_url(value)
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = extract_mp4_url(item)
+            if found:
+                return found
+    return None
 
 
 def iter_video_urls(csv_path: Path) -> Iterable[str]:
@@ -76,12 +114,11 @@ def iter_video_urls(csv_path: Path) -> Iterable[str]:
             except json.JSONDecodeError:
                 print(f"[WARN] JSON 解析失败，跳过：{raw[:80]}...")
                 continue
-            video = data.get("video") or {}
-            url = video.get("url")
-            if isinstance(url, str) and url.strip():
-                yield url.strip()
+            url = extract_mp4_url(data)
+            if url:
+                yield url
             else:
-                print(f"[WARN] 找不到 url 字段，跳过：{raw[:80]}...")
+                print(f"[WARN] 找不到视频链接，跳过：{raw[:120]}...")
 
 
 def url_to_filename(url: str) -> str:
