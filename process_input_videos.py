@@ -77,7 +77,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
     status_path = output_dir / "status.csv"
     with status_path.open("w", encoding="utf-8", newline="") as status_file:
         writer = csv.writer(status_file)
-        writer.writerow(["序号", "原文件名", "裁剪帧数", "裁剪时长(秒)", "状态", "人工校验"])
+        writer.writerow(["序号", "原文件名", "裁剪帧数", "裁剪时长(秒)", "状态", "裁剪原因", "人工校验"])
         status_file.flush()
 
         status_lock = threading.Lock()
@@ -98,6 +98,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                     "0.00",
                     "缺失",
                     "",
+                    "",
                 ], None
             try:
                 result = light.process_single_video(
@@ -117,6 +118,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                     "0.00",
                     f"失败: {exc}",
                     "",
+                    "",
                 ], None
 
             if not result:
@@ -127,9 +129,10 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                     "0.00",
                     "跳过",
                     "",
+                    "",
                 ], None
 
-            _, _, _, trimmed_frames, trimmed_seconds = result
+            _, _, _, trimmed_frames, trimmed_seconds, reason_label = result
             status = "已裁剪" if trimmed_frames > 0 else "保持原样"
             return [
                 str(entry.index),
@@ -137,6 +140,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                 str(trimmed_frames),
                 f"{trimmed_seconds:.2f}",
                 status,
+                reason_label,
                 "",
             ], trimmed_frames
 
@@ -153,6 +157,7 @@ def process_videos(entries: Iterable[VideoEntry], args: argparse.Namespace) -> N
                             "0",
                             "0.00",
                             "重复跳过",
+                            "",
                             "",
                         ]
                     )

@@ -40,7 +40,7 @@ class GridDetectionResult:
     is_grid: bool  # 是否是宫格帧
     vertical_score: float  # 竖线分数 (0-1)
     horizontal_score: float  # 横线分数 (0-1)
-    grid_type: str  # "none", "two_h", "two_v", "four"
+    grid_type: str  # "none", "two_h", "two_v", "four", "single"
 
 
 def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridDetectionResult:
@@ -94,6 +94,8 @@ def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridD
     elif black_ratio >= BG_RATIO_THRESHOLD:
         background_value = 0
 
+    single_detected = False
+
     if background_value is not None:
         # 纯黑 / 纯白背景：先提取非背景区域
         mask = (np.abs(gray.astype(np.int16) - background_value) > BG_TOLERANCE).astype(np.uint8) * 255
@@ -111,6 +113,25 @@ def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridD
             horizontal_band = mask_bool[top:bottom, :]
             vertical_score = compute_band_background_ratio(vertical_band, axis=0)
             horizontal_score = compute_band_background_ratio(horizontal_band, axis=1)
+
+            # 额外检测单宫格：大块矩形拼接
+            ys = np.any(mask_bool, axis=1)
+            xs = np.any(mask_bool, axis=0)
+            if np.any(ys) and np.any(xs):
+                y_idx = np.where(ys)[0]
+                x_idx = np.where(xs)[0]
+                height = float(y_idx[-1] - y_idx[0] + 1)
+                width = float(x_idx[-1] - x_idx[0] + 1)
+                box_area_ratio = (height * width) / mask_bool.size
+                fill_ratio = content_ratio / max(box_area_ratio, 1e-6)
+                aspect_ratio = max(width / max(height, 1e-6), height / max(width, 1e-6))
+                if (
+                    box_area_ratio >= 0.18
+                    and box_area_ratio <= 0.95
+                    and fill_ratio >= 0.6
+                    and aspect_ratio <= 2.8
+                ):
+                    single_detected = True
     else:
         # 2) 普通背景：使用边缘检测
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -136,6 +157,9 @@ def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridD
     elif has_horizontal:
         grid_type = "two_h"
         is_grid = True
+    elif single_detected:
+        grid_type = "single"
+        is_grid = True
     else:
         grid_type = "none"
         is_grid = False
@@ -148,11 +172,39 @@ def detect_center_split_line(frame: np.ndarray, threshold: float = 0.6) -> GridD
     )
 
 
+def detect_flash_transition(
+    frames: List[np.ndarray],
+    diff_threshold: float = 0.15,
+    consecutive: int = 2,
+) -> Tuple[bool, int]:
+    """
+    回退策略：若未检测到宫格，检查前几帧是否与后续帧存在明显闪烁/切换。
+
+    diff_threshold: 帧均值差异（0-1），超过该值判定为闪动
+    consecutive: 连续满足阈值的帧数
+    """
+    if len(frames) <= consecutive:
+        return False, -1
+    base = frames[0].astype(np.float32)
+    streak = 0
+    flash_idx = -1
+    for idx in range(1, len(frames)):
+        diff = np.mean(np.abs(base - frames[idx].astype(np.float32))) / 255.0
+        if diff >= diff_threshold:
+            streak += 1
+            flash_idx = idx
+            if streak >= consecutive:
+                return True, max(0, flash_idx - 1)
+        else:
+            streak = 0
+    return False, -1
+
+
 def analyze_video_for_grid(
     video_path: pathlib.Path,
     max_check_seconds: float,
     grid_threshold: float,
-) -> Tuple[int, int, float, List[GridDetectionResult]]:
+) -> Tuple[int, int, float, List[GridDetectionResult], str]:
     """
     分析视频前若干秒，检测宫格帧。
     
@@ -169,7 +221,10 @@ def analyze_video_for_grid(
     results: List[GridDetectionResult] = []
     frame_idx = 0
     last_grid_idx = -1  # 最后一个宫格帧的索引
+    reason_tag = "none"
     
+    flash_frames: List[np.ndarray] = []
+
     while frame_idx < max_check_frames:
         ret, frame = capture.read()
         if not ret:
@@ -178,17 +233,38 @@ def analyze_video_for_grid(
         result = detect_center_split_line(frame, threshold=grid_threshold)
         results.append(result)
         
+        flash_small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+        flash_gray = cv2.cvtColor(flash_small, cv2.COLOR_BGR2GRAY)
+        flash_frames.append(flash_gray)
+
         if result.is_grid:
             last_grid_idx = frame_idx
+            reason_tag = result.grid_type
         
         frame_idx += 1
     
     capture.release()
     
+    if last_grid_idx < 0 and flash_frames:
+        flash_detected, flash_idx = detect_flash_transition(flash_frames)
+        if flash_detected:
+            last_grid_idx = flash_idx
+            reason_tag = "flash"
+
     # 裁剪策略：删除从开头到最后一个宫格帧（包含该帧）
     trim_frames = last_grid_idx + 1 if last_grid_idx >= 0 else 0
     
-    return trim_frames, total_frames, fps, results
+    return trim_frames, total_frames, fps, results, reason_tag
+
+
+def format_trim_reason(reason_tag: str) -> str:
+    if reason_tag == "four":
+        return "4宫格"
+    if reason_tag in ("two_h", "two_v"):
+        return "2宫格"
+    if reason_tag in ("flash", "single"):
+        return "1宫格"
+    return ""
 
 
 def export_video_without_prefix(
@@ -335,16 +411,17 @@ def process_single_video(
     max_trim_seconds: float,
     codec: str,
     dry_run: bool,
-) -> Optional[Tuple[str, float, float, int, float]]:
+) -> Optional[Tuple[str, float, float, int, float, str]]:
     """处理单个视频"""
     start_time = time.perf_counter()
     print(f"\n==== 处理 {input_path.name} ====")
     
-    trim_frames, total_frames, fps, results = analyze_video_for_grid(
+    trim_frames, total_frames, fps, results, reason_tag = analyze_video_for_grid(
         input_path,
         max_check_seconds=max_check_seconds,
         grid_threshold=grid_threshold,
     )
+    reason_label = format_trim_reason(reason_tag)
     
     # 限制最大裁剪帧数
     max_trim_frames = max(0, math.floor(fps * max(0.0, max_trim_seconds)))
@@ -375,11 +452,11 @@ def process_single_video(
         if dry_run:
             elapsed = time.perf_counter() - start_time
             print(f"  [Dry-run] 保持原样 (用时 {elapsed:.2f}s)")
-            return (input_path.name, original_duration, original_duration, 0, 0.0)
+            return (input_path.name, original_duration, original_duration, 0, 0.0, "")
         shutil.copy2(input_path, output_path)
         elapsed = time.perf_counter() - start_time
         print(f"  保持原样，复制到 {output_path} (用时 {elapsed:.2f}s)")
-        return (input_path.name, original_duration, original_duration, 0, 0.0)
+        return (input_path.name, original_duration, original_duration, 0, 0.0, "")
     
     print(f"  将裁掉前 {trim_frames} 帧 ({trim_duration:.2f}s)")
     
@@ -387,7 +464,14 @@ def process_single_video(
         elapsed = time.perf_counter() - start_time
         output_duration = original_duration - trim_duration
         print(f"  [Dry-run] 用时 {elapsed:.2f}s")
-        return (input_path.name, original_duration, output_duration, trim_frames, trim_duration)
+        return (
+            input_path.name,
+            original_duration,
+            output_duration,
+            trim_frames,
+            trim_duration,
+            reason_label,
+        )
     
     original_dur, output_dur, actual_trim = export_video_without_prefix(
         input_path, output_path, trim_frames=trim_frames, codec=codec,
@@ -395,7 +479,14 @@ def process_single_video(
     elapsed = time.perf_counter() - start_time
     actual_trim_dur = actual_trim / fps if fps > 0 else 0.0
     print(f"  输出: {output_path} (裁剪 {actual_trim} 帧, 用时 {elapsed:.2f}s)")
-    return (input_path.name, original_dur, output_dur, actual_trim, actual_trim_dur)
+    return (
+        input_path.name,
+        original_dur,
+        output_dur,
+        actual_trim,
+        actual_trim_dur,
+        reason_label,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -428,7 +519,7 @@ def main() -> None:
 
     print(f"共 {len(files)} 个视频，阈值: {args.grid_threshold}")
     
-    stats: List[Tuple[str, float, float, int, float]] = []
+    stats: List[Tuple[str, float, float, int, float, str]] = []
     for path in files:
         result = process_single_video(
             input_path=path,
@@ -450,9 +541,13 @@ def main() -> None:
         csv_path = output_dir / "processing_stats.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["文件名", "原始时长(秒)", "处理后时长(秒)", "裁剪帧数", "裁剪时长(秒)"])
+            writer.writerow(
+                ["文件名", "原始时长(秒)", "处理后时长(秒)", "裁剪帧数", "裁剪时长(秒)", "裁剪原因"]
+            )
             for row in stats:
-                writer.writerow([row[0], f"{row[1]:.2f}", f"{row[2]:.2f}", row[3], f"{row[4]:.2f}"])
+                writer.writerow(
+                    [row[0], f"{row[1]:.2f}", f"{row[2]:.2f}", row[3], f"{row[4]:.2f}", row[5]]
+                )
         print(f"统计: {csv_path}")
         
         trimmed = sum(1 for s in stats if s[3] > 0)
