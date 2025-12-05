@@ -218,7 +218,7 @@ def export_video_without_prefix(
     temp_dir = tempfile.TemporaryDirectory(prefix="grid_trim_")
     temp_dir_path = pathlib.Path(temp_dir.name)
     temp_video_path = temp_dir_path / "video_only.mp4"
-    temp_audio_path = temp_dir_path / "audio_track.aac"
+    temp_audio_path = temp_dir_path / "audio_track.m4a"
 
     # 写出视频（无音频）
     fourcc = cv2.VideoWriter_fourcc(*codec)
@@ -242,21 +242,48 @@ def export_video_without_prefix(
         temp_dir.cleanup()
         return original_duration, output_duration, trim_frames
 
-    # 提取音轨并裁剪相同的起始时间
-    audio_cmd = [
-        ffmpeg_path,
-        "-y",
-        "-ss",
-        f"{start_seconds:.6f}",
-        "-i",
-        str(video_path),
-        "-vn",
-        "-acodec",
-        "copy",
-        str(temp_audio_path),
-    ]
-    audio_result = subprocess.run(audio_cmd, capture_output=True)
-    if audio_result.returncode != 0:
+    def extract_audio(reencode: bool) -> bool:
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(video_path),
+        ]
+        if start_seconds > 0:
+            cmd += ["-ss", f"{start_seconds:.6f}"]
+        cmd += ["-vn"]
+        if reencode:
+            cmd += [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+            ]
+        else:
+            cmd += [
+                "-c:a",
+                "copy",
+            ]
+        cmd += [
+            "-avoid_negative_ts",
+            "1",
+            str(temp_audio_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            print(
+                f"  警告: 音轨提取失败({ '重编码' if reencode else '直接复制' }), "
+                "尝试其它策略。"
+            )
+            return False
+        return True
+
+    audio_ok = extract_audio(reencode=True)
+    if not audio_ok:
+        audio_ok = extract_audio(reencode=False)
+    if not audio_ok:
         print("  警告: 音轨提取失败，输出将是无声视频。")
         shutil.copy2(temp_video_path, output_path)
         temp_dir.cleanup()
@@ -276,6 +303,7 @@ def export_video_without_prefix(
         "0:v:0",
         "-map",
         "1:a:0",
+        "-shortest",
         str(output_path),
     ]
     mux_result = subprocess.run(mux_cmd, capture_output=True)
