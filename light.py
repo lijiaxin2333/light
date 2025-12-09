@@ -291,6 +291,42 @@ def export_video_without_prefix(
     start_seconds = trim_frames / fps if fps > 0 else 0.0
     output_duration = max(0.0, original_duration - start_seconds)
 
+    ffmpeg_path = shutil.which("ffmpeg")
+    # 优先使用 ffmpeg 做无重编码裁剪，保持原始编码和清晰度
+    if trim_frames == 0 and ffmpeg_path is None:
+        capture.release()
+        shutil.copy2(video_path, output_path)
+        return original_duration, output_duration, trim_frames
+
+    if ffmpeg_path is not None:
+        capture.release()
+        copy_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss",
+            f"{start_seconds:.6f}",
+            "-i",
+            str(video_path),
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "1",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        copy_result = subprocess.run(copy_cmd, capture_output=True)
+        if copy_result.returncode == 0:
+            return original_duration, output_duration, trim_frames
+        else:
+            print("  警告: ffmpeg 无重编码裁剪失败，回退到重写视频路径。")
+            # 失败则重新打开视频走旧逻辑
+            capture = cv2.VideoCapture(str(video_path))
+            if not capture.isOpened():
+                raise RuntimeError(f"无法重新打开视频: {video_path}")
+
     temp_dir = tempfile.TemporaryDirectory(prefix="grid_trim_")
     temp_dir_path = pathlib.Path(temp_dir.name)
     temp_video_path = temp_dir_path / "video_only.mp4"
